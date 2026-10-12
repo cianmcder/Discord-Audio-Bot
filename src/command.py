@@ -25,15 +25,32 @@ load_dotenv("tokens.env")
 # REMINDER: Commands must be issued via the chat within the Voice Channel
 # (click the "Open Chat" bubble icon next to the voice channel)
 
+# installed bgutil locally to bypass Youtube's requirement for PO tokens
+# C:\Program Files\bgutil\bgutil-ytdlp-pot-provider\server
+# from CMD line above run "node build/main.js"
+
 @bot.command()
 async def join(ctx: commands.Context):
     """ Joins the current voice channel. """
-    if ctx.message.author.voice.channel:
-        channel = ctx.author.voice.channel
+    if ctx.author.voice is None:
+        return await ctx.send(
+            "This command will not work unless you're in a voice channel."
+        )
+
+    channel = ctx.author.voice.channel
+
+    if ctx.voice_client is not None:
+        await ctx.voice_client.move_to(channel)
+        return await ctx.send(f"Audio bot moved to channel {channel.name}")
+
+    try:
         await channel.connect()
-        return await ctx.send(f"Audio bot connected to channel {channel.name}")
-    else:
-        return await ctx.send("This command will not work unless you're in a voice channel.")
+        return await ctx.send(
+            f"Audio bot connected to channel {channel.name}"
+        )
+    except Exception as e:
+        print(f"Failed to connect to voice: {e}")
+        return await ctx.send(f"Failed to connect to {channel.name}: {e}")
 
 @bot.command()
 async def leave(ctx: commands.Context):
@@ -46,58 +63,14 @@ async def playmusic(ctx: commands.Context, file: str):
     """ Plays audio url as defined in music.env """
     if ctx.author.voice is None:
         return await ctx.send("You must connect to a voice channel first.")
-
     await play(ctx, file, True)
-
-    # create music dict object; replaces below block that temporarily loads .env file vars
-    '''music_dict = dotenv_values("music.env")
-    if music_dict is None:
-        return await ctx.send("Music library is empty: No music to play.")
-    url = music_dict.get(file)
-    if url is None or isYoutubeUrl(url) is False:
-        return await ctx.send(f"Could not retrieve Youtube url using name: {file}")
-
-    # ctx.bot.voice_clients is always None when running. Should I specify a different object?
-    if ctx.bot.voice_clients is None:
-        # allows use of CustomVoiceClient class 
-        vc = await ctx.author.voice.channel.connect(cls=CustomVoiceClient)
-        vc.add_track(discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(f"music/{file}.mp3")))
-        return await ctx.send(embed=discord.Embed(title=f"Now Playing: {file}"), view=PlayerUi(vc))
-    else:
-        audio_url = await youtubedl(url)
-        vc = ctx.voice_client
-        vc.stop()
-        vc.play(discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTIONS))
-        await ctx.send(f"Now Playing: {file}")'''
 
 @bot.command()
 async def playsfx(ctx: commands.Context, file: str):
     """ Plays audio url as defined in sfx.env """
     if ctx.author.voice is None:
         return await ctx.send("You must connect to a voice channel first.")
-
     await play(ctx, file, False)
-
-    # temporarily load music.env during method
-    """load_dotenv("sfx.env")
-    url = os.getenv(file)
-    if url is None or isYoutubeUrl(url) is False:
-        return await ctx.send(f"Could not retrieve Youtube url using name {file}")
-
-    # ctx.bot.voice_clients is always None when running. Should I specify a different object?
-    if ctx.bot.voice.client is None:
-        voice_client = await ctx.author.voice.channel.connect(cls=CustomVoiceClient)
-        voice_client.add_track(discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(f"sfx/{file}.mp3")))
-        return await ctx.send(embed=discord.Embed(title=f"Now Playing: {file}"), view=PlayerUi(voice_client))
-    else:
-        audio_url = await youtubedl(url)
-        vc = ctx.voice_client
-        vc.stop()
-        vc.play(discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTIONS))
-        await ctx.send(f"Now Playing: {file}")
-
-    # remove variables loaded from music.env
-    del os.environ["sfx.env"]"""
 
 @bot.command()
 async def stop(ctx: commands.Context):
@@ -121,17 +94,55 @@ async def play(ctx : commands.Context, file : str, music: bool):
     if url is None or isYoutubeUrl(url) is False:
         return await ctx.send(f"Could not retrieve Youtube url using name: {file}")
 
-    # ctx.bot.voice_clients is always None when running. Should I specify a different object?
-    '''if ctx.bot.voice_clients is None:
-        # allows use of CustomVoiceClient class 
-        vc = await ctx.author.voice.channel.connect(cls=CustomVoiceClient)
-        vc.add_track(discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(f"music/{file}.mp3")))
-        return await ctx.send(embed=discord.Embed(title=f"Now Playing: {file}"), view=PlayerUi(vc))
-    else:'''
-    audio_url = await youtubedl(url)
+    stream = await youtubedl(url)
+    
     vc = ctx.voice_client
-    vc.stop()
-    vc.play(discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTIONS))
+    if vc is None or not vc.is_connected():
+        return await ctx.send("The bot is not connected to a voice channel.")
+    if vc.is_playing():
+        vc.stop()
+    
+    source = discord.FFmpegPCMAudio(
+        stream["url"],
+        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        options="-vn",
+        **{
+            "executable": r"C:\ffmpeg\bin\ffmpeg.exe",
+            "stderr": None,
+        },
+    )
+    
+    # Pass the headers extracted by yt-dlp to FFmpeg.
+    headers = stream["headers"]
+    if headers:
+        header_string = "".join(
+            f"{key}: {value}\r\n"
+            for key, value in headers.items()
+        )
+        source = discord.FFmpegPCMAudio(
+            stream["url"],
+            before_options=(
+                "-reconnect 1 -reconnect_streamed 1 "
+                "-reconnect_delay_max 5 "
+                f'-headers "{header_string}"'
+            ),
+            options="-vn",
+            executable=r"C:\ffmpeg\bin\ffmpeg.exe",
+        )
+    
+    def after_playback(error):
+        if error:
+            print(f"Discord audio playback error: {error}")
+
+    vc.play(
+        discord.PCMVolumeTransformer(source, volume=0.5),
+        after=after_playback,
+    )
+
+    await ctx.send(f"Starting playback: {stream['title']}")
+    
+    # vc.stop()
+    # vc.play(discord.FFmpegPCMAudio(stream, **FFMPEG_OPTIONS))
     await ctx.send(f"Now Playing: {file}")
 
 def isYoutubeUrl(url : str):
