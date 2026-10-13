@@ -1,19 +1,13 @@
-import discord
-from discord.ext import commands
-from dotenv import dotenv_values
-from dotenv import load_dotenv
 import os
 
-# from player import CustomVoiceClient
-# from player import PlayerUi
-from youtube import youtubedl
+import discord
+from discord.ext import commands
+from dotenv import dotenv_values, load_dotenv
 
-FFMPEG_PATH = "C:\\ffmpeg\\bin"
+from audio_mixer import LayeredAudioSource
+from youtube import make_youtube_source, youtubedl
 
-FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn',
-}
+FFMPEG_EXECUTABLE = r"C:\ffmpeg\bin\ffmpeg.exe"
 
 intents = discord.Intents.default()
 intents.voice_states = True
@@ -21,6 +15,29 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 load_dotenv("tokens.env")
+
+# One mixer per Discord server (guild).
+mixers: dict[int, LayeredAudioSource] = {}
+
+
+def get_mixer(vc: discord.VoiceClient) -> LayeredAudioSource:
+    guild_id = vc.guild.id
+    mixer = mixers.get(guild_id)
+    if mixer is None or mixer.closed:
+        mixer = LayeredAudioSource()
+        mixers[guild_id] = mixer
+    return mixer
+
+
+def start_mixer_if_needed(vc: discord.VoiceClient,
+                          mixer: LayeredAudioSource) -> None:
+    # The mixer is the one and only source played by the voice client.
+    if not vc.is_playing() and not vc.is_paused():
+        vc.play(
+            mixer,
+            after=lambda error: print(f"Discord mixer playback error: {error}")
+            if error else None,
+        )
 
 # REMINDER: Commands must be issued via the chat within the Voice Channel
 # (click the "Open Chat" bubble icon next to the voice channel)
@@ -54,100 +71,103 @@ async def join(ctx: commands.Context):
 
 @bot.command()
 async def leave(ctx: commands.Context):
-    """ Leaves the voice channel """
-    await ctx.send(f"Audio bot leaving channel {ctx.author.voice.channel.name}")
-    return await ctx.voice_client.disconnect(force=True)
+    """Stop all layers and disconnect."""
+    vc = ctx.voice_client
+    if vc is None:
+        return await ctx.send("The bot is not connected to a voice channel.")
+
+    mixer = mixers.get(ctx.guild.id) if ctx.guild else None
+    if mixer is not None:
+        mixer.stop_all()
+    channel_name = vc.channel.name if vc.channel else "the voice channel"
+    await vc.disconnect(force=True)
+    return await ctx.send(f"Audio bot left {channel_name}.")
+
 
 @bot.command()
 async def playmusic(ctx: commands.Context, file: str):
-    """ Plays audio url as defined in music.env """
-    if ctx.author.voice is None:
-        return await ctx.send("You must connect to a voice channel first.")
-    await play(ctx, file, True)
+    """Start or replace background music from music.env."""
+    await play_layer(ctx, file, "music.env", "music", 0.45)
+
 
 @bot.command()
 async def playsfx(ctx: commands.Context, file: str):
-    """ Plays audio url as defined in sfx.env """
+    """Play a sound effect over any current background music."""
+    await play_layer(ctx, file, "sfx.env", "sfx", 0.85)
+
+
+async def play_layer(ctx: commands.Context, file: str,
+                     env_file: str, layer_name: str, volume: float):
     if ctx.author.voice is None:
-        return await ctx.send("You must connect to a voice channel first.")
-    await play(ctx, file, False)
+        return await ctx.send("You must be in a voice channel first.")
+
+    vc = ctx.voice_client
+    if vc is None or not vc.is_connected():
+        return await ctx.send("Use !join first to connect the bot to voice.")
+
+    library = dotenv_values(env_file)
+    if not library:
+        return await ctx.send(f"Audio library is empty: {env_file}")
+
+    url = library.get(file)
+    if not url or not is_youtube_url(url):
+        return await ctx.send(f"Could not retrieve a YouTube URL for: {file}")
+
+    try:
+        stream = await youtubedl(url)
+
+        print("Stream title:", stream.get("title"))
+
+        source = make_youtube_source(url)
+        mixer = get_mixer(vc)
+        # Replaces only this layer. Music and SFX can coexist.
+        mixer.add(layer_name, source, volume=volume)
+        start_mixer_if_needed(vc, mixer)
+
+        title = stream.get("title", file)
+        if layer_name == "music":
+            await ctx.send(f"Background music: {title}")
+        else:
+            await ctx.send(f"Playing sound effect: {title}")
+    except Exception as exc:
+        print(f"Could not start {layer_name} '{file}': {exc}")
+        await ctx.send(f"Could not play {file}: {exc}")
+
+
+@bot.command()
+async def stopmusic(ctx: commands.Context):
+    """Stop only the background music layer."""
+    return await stop_layer(ctx, "music", "Background music stopped.")
+
+
+@bot.command()
+async def stopsfx(ctx: commands.Context):
+    """Stop only the current sound-effect layer."""
+    return await stop_layer(ctx, "sfx", "Sound effect stopped.")
+
+
+async def stop_layer(ctx: commands.Context, layer_name: str, message: str):
+    if ctx.author.voice is None:
+        return await ctx.send("You must be in a voice channel first.")
+    mixer = mixers.get(ctx.guild.id) if ctx.guild else None
+    if mixer is None or not mixer.remove(layer_name):
+        return await ctx.send(f"No {layer_name} audio is currently playing.")
+    return await ctx.send(message)
+
 
 @bot.command()
 async def stop(ctx: commands.Context):
-    """ Stops playing current audio """
+    """Stop all audio layers but keep the bot connected."""
     if ctx.author.voice is None:
-        return await ctx.send("You must connect to a voice channel first.")
-    ctx.voice_client.stop()
-    return await ctx.send("Ended audio.")
+        return await ctx.send("You must be in a voice channel first.")
+    mixer = mixers.get(ctx.guild.id) if ctx.guild else None
+    if mixer is not None:
+        mixer.stop_all()
+    return await ctx.send("All audio layers stopped.")
 
-# define as code shared between playmusic and playsfx; remove bloat
-async def play(ctx : commands.Context, file : str, music: bool):
-    # create dict object and populates with .env
-    if music:
-        dict = dotenv_values("music.env")
-    else:
-        dict = dotenv_values("sfx.env")
 
-    if not dict:
-        return await ctx.send("Audio library is empty: Nothing to play.")
-    url = dict.get(file)
-    if url is None or isYoutubeUrl(url) is False:
-        return await ctx.send(f"Could not retrieve Youtube url using name: {file}")
+def is_youtube_url(url: str) -> bool:
+    return url.startswith("https://www.youtube.com/watch?v=")
 
-    stream = await youtubedl(url)
-    
-    vc = ctx.voice_client
-    if vc is None or not vc.is_connected():
-        return await ctx.send("The bot is not connected to a voice channel.")
-    if vc.is_playing():
-        vc.stop()
-    
-    source = discord.FFmpegPCMAudio(
-        stream["url"],
-        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-        options="-vn",
-        **{
-            "executable": r"C:\ffmpeg\bin\ffmpeg.exe",
-            "stderr": None,
-        },
-    )
-    
-    # Pass the headers extracted by yt-dlp to FFmpeg.
-    headers = stream["headers"]
-    if headers:
-        header_string = "".join(
-            f"{key}: {value}\r\n"
-            for key, value in headers.items()
-        )
-        source = discord.FFmpegPCMAudio(
-            stream["url"],
-            before_options=(
-                "-reconnect 1 -reconnect_streamed 1 "
-                "-reconnect_delay_max 5 "
-                f'-headers "{header_string}"'
-            ),
-            options="-vn",
-            executable=r"C:\ffmpeg\bin\ffmpeg.exe",
-        )
-    
-    def after_playback(error):
-        if error:
-            print(f"Discord audio playback error: {error}")
 
-    vc.play(
-        discord.PCMVolumeTransformer(source, volume=0.5),
-        after=after_playback,
-    )
-
-    await ctx.send(f"Starting playback: {stream['title']}")
-    
-    # vc.stop()
-    # vc.play(discord.FFmpegPCMAudio(stream, **FFMPEG_OPTIONS))
-    await ctx.send(f"Now Playing: {file}")
-
-def isYoutubeUrl(url : str):
-    if url.startswith("https://www.youtube.com/watch?v="):
-        return True
-    return False
-
-bot.run(os.environ['BOT_TOKEN'])
+bot.run(os.environ["BOT_TOKEN"])
